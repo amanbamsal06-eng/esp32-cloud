@@ -1,47 +1,19 @@
-from fastapi import FastAPI, Header, HTTPException, Depends
-from sqlalchemy import create_engine, Column, String, Boolean, TIMESTAMP
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from fastapi import FastAPI, Header, HTTPException
 from datetime import datetime, timedelta
 import secrets
 import os
+from supabase import create_client
 
 # -------------------------------------------------
-# DATABASE SETUP
+# SUPABASE SETUP
 # -------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=3,
-    max_overflow=5
-)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Supabase env vars not set")
 
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
-
-Base = declarative_base()
-
-# -------------------------------------------------
-# DEVICE TABLE (must already exist in Supabase)
-# -------------------------------------------------
-class Device(Base):
-    __tablename__ = "devices"
-
-    device_id = Column(String, primary_key=True)
-    device_token = Column(String, unique=True, nullable=False)
-    device_state = Column(String, default="OFF")
-    token_expiry = Column(TIMESTAMP)
-    active = Column(Boolean, default=True)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow)
-
-# ❌ DO NOT auto-create tables in prod
-# Base.metadata.create_all(bind=engine)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # -------------------------------------------------
 # FASTAPI APP
@@ -49,65 +21,57 @@ class Device(Base):
 app = FastAPI()
 
 # -------------------------------------------------
-# DB DEPENDENCY
-# -------------------------------------------------
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# -------------------------------------------------
 # HELPERS
 # -------------------------------------------------
 def generate_token():
     return secrets.token_hex(32)
 
-def authenticate(db: Session, token: str):
+def authenticate(token: str):
     if not token:
         raise HTTPException(status_code=401, detail="TOKEN_REQUIRED")
 
-    device = db.query(Device).filter(
-        Device.device_token == token,
-        Device.active == True
-    ).first()
+    res = supabase.table("devices").select("*").eq(
+        "device_token", token
+    ).eq("active", True).single().execute()
 
-    if not device:
+    if not res.data:
         raise HTTPException(status_code=401, detail="INVALID_TOKEN")
 
-    if device.token_expiry and device.token_expiry < datetime.utcnow():
-        raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
+    if res.data["token_expiry"]:
+        if datetime.fromisoformat(res.data["token_expiry"]) < datetime.utcnow():
+            raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
 
-    return device
+    return res.data
 
 # -------------------------------------------------
 # HEALTH CHECK
 # -------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "server running with postgres"}
+    return {"status": "server running with supabase api"}
 
 # -------------------------------------------------
-# DEVICE PROVISIONING (FIRST TIME)
+# DEVICE PROVISIONING
 # -------------------------------------------------
 @app.post("/provision")
-def provision(device_id: str, db: Session = Depends(get_db)):
-    existing = db.query(Device).filter(Device.device_id == device_id).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="DEVICE_ALREADY_EXISTS")
+def provision(device_id: str):
+    existing = supabase.table("devices").select("device_id").eq(
+        "device_id", device_id
+    ).execute()
+
+    if existing.data:
+        raise HTTPException(400, detail="DEVICE_ALREADY_EXISTS")
 
     token = generate_token()
 
-    device = Device(
-        device_id=device_id,
-        device_token=token,
-        token_expiry=datetime.utcnow() + timedelta(days=30),
-        updated_at=datetime.utcnow()
-    )
-
-    db.add(device)
-    db.commit()
+    supabase.table("devices").insert({
+        "device_id": device_id,
+        "device_token": token,
+        "device_state": "OFF",
+        "token_expiry": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+        "active": True,
+        "updated_at": datetime.utcnow().isoformat()
+    }).execute()
 
     return {
         "device_id": device_id,
@@ -116,61 +80,47 @@ def provision(device_id: str, db: Session = Depends(get_db)):
     }
 
 # -------------------------------------------------
-# SEND COMMAND (APP / USER)
+# SEND COMMAND
 # -------------------------------------------------
 @app.post("/send_command")
-def send_command(
-    command: str,
-    authorization: str = Header(None),
-    db: Session = Depends(get_db)
-):
+def send_command(command: str, authorization: str = Header(None)):
     if command not in ["ON", "OFF"]:
-        raise HTTPException(status_code=400, detail="INVALID_COMMAND")
+        raise HTTPException(400, detail="INVALID_COMMAND")
 
-    device = authenticate(db, authorization)
+    device = authenticate(authorization)
 
-    device.device_state = command
-    device.updated_at = datetime.utcnow()
-    db.commit()
+    supabase.table("devices").update({
+        "device_state": command,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("device_id", device["device_id"]).execute()
 
     return {"status": "stored", "command": command}
 
 # -------------------------------------------------
-# DEVICE POLL COMMAND (ESP)
+# DEVICE POLL
 # -------------------------------------------------
 @app.get("/device/command")
-def get_command(
-    authorization: str = Header(None),
-    db: Session = Depends(get_db)
-):
-    device = authenticate(db, authorization)
-    return {"command": device.device_state}
+def get_command(authorization: str = Header(None)):
+    device = authenticate(authorization)
+    return {"command": device["device_state"]}
 
 # -------------------------------------------------
 # TOKEN REFRESH
 # -------------------------------------------------
 @app.post("/refresh_token")
-def refresh_token(
-    device_id: str,
-    authorization: str = Header(None),
-    db: Session = Depends(get_db)
-):
-    device = db.query(Device).filter(
-        Device.device_token == authorization,
-        Device.device_id == device_id,
-        Device.active == True
-    ).first()
+def refresh_token(device_id: str, authorization: str = Header(None)):
+    device = authenticate(authorization)
 
-    if not device:
-        raise HTTPException(status_code=401, detail="INVALID_REFRESH_REQUEST")
+    if device["device_id"] != device_id:
+        raise HTTPException(401, detail="INVALID_REFRESH_REQUEST")
 
     new_token = generate_token()
 
-    device.device_token = new_token
-    device.token_expiry = datetime.utcnow() + timedelta(days=30)
-    device.updated_at = datetime.utcnow()
-
-    db.commit()
+    supabase.table("devices").update({
+        "device_token": new_token,
+        "token_expiry": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("device_id", device_id).execute()
 
     return {
         "device_token": new_token,
@@ -178,17 +128,13 @@ def refresh_token(
     }
 
 # -------------------------------------------------
-# DEVICE REVOKE (ADMIN)
+# REVOKE DEVICE
 # -------------------------------------------------
 @app.post("/revoke_device")
-def revoke_device(device_id: str, db: Session = Depends(get_db)):
-    device = db.query(Device).filter(Device.device_id == device_id).first()
-
-    if not device:
-        raise HTTPException(status_code=404, detail="DEVICE_NOT_FOUND")
-
-    device.active = False
-    device.updated_at = datetime.utcnow()
-    db.commit()
+def revoke_device(device_id: str):
+    supabase.table("devices").update({
+        "active": False,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("device_id", device_id).execute()
 
     return {"status": "device_revoked"}
