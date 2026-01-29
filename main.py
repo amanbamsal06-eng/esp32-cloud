@@ -27,11 +27,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # -------------------------------------------------
 # SUPABASE CLIENT
 # -------------------------------------------------
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    print(f"Failed to init Supabase: {e}")
-    supabase = None
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Supabase env vars not set")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # -------------------------------------------------
 # MQTT CLIENT
