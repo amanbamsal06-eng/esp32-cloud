@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-python-jose
+pydantic
+pydantic-settings
+python-jose[cryptography]
 supabase
 redis
 paho-mqtt
