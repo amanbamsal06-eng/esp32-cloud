@@ -1,180 +1,157 @@
 import os
 import json
 import time
-import logging
 import uuid
+import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List
-from contextlib import asynccontextmanager
+from typing import Dict, Any, Optional
 
-# Third-party imports
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, status, Request, BackgroundTasks
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import FastAPI, Depends, HTTPException, Header, status, Request, BackgroundTasks
+from fastapi.security import OAuth2PasswordBearer, APIKeyHeader
 from pydantic import BaseModel
-from supabase import create_client, Client as SupabaseClient
+from supabase import create_client, Client
 import redis.asyncio as redis
 import paho.mqtt.client as mqtt
 from jose import JWTError, jwt
 
-# ==========================================
-# --- 1. CONFIGURATION (Environment Vars) ---
-# ==========================================
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-long-production-secret")
+# --- 1. SECURE CONFIGURATION ---
+# IMPORTANT: Add 'ADMIN_API_KEY' to your Render environment variables!
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-this-to-a-32-char-random-string")
+ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=True)
+
+JWT_SECRET = os.getenv("JWT_SECRET_KEY")
 ALGORITHM = "HS256"
 
-# Database & Broker Config (From Render Dashboard)
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
+# Database Connections
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+redis_client = redis.from_url(os.getenv("UPSTASH_REDIS_URL"), decode_responses=True)
 
-MQTT_BROKER = os.getenv("MQTT_BROKER", "broker.emqx.io")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
-MQTT_USER = os.getenv("MQTT_USER")
-MQTT_PASS = os.getenv("MQTT_PASS")
-
-# Logger Setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("IOT_GATEWAY")
-
-# ==========================================
-# --- 2. DATABASE & MQTT CLIENTS ---
-# ==========================================
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
-
-class MQTTService:
+# MQTT v5 Manager
+class MQTTManager:
     def __init__(self):
         self.client = mqtt.Client(protocol=mqtt.MQTTv5)
-        if MQTT_USER and MQTT_PASS:
-            self.client.username_pw_set(MQTT_USER, MQTT_PASS)
-
+        user = os.getenv("MQTT_USER")
+        pw = os.getenv("MQTT_PASSWORD")
+        if user and pw: self.client.username_pw_set(user, pw)
+    
     def start(self):
-        self.client.connect_async(MQTT_BROKER, MQTT_PORT)
+        self.client.connect_async(os.getenv("MQTT_BROKER", "broker.emqx.io"), 1883)
         self.client.loop_start()
 
-    def publish_cmd(self, device_id: str, action: str, val: Any = None):
+    def send(self, device_id: str, action: str):
         topic = f"iot/{device_id}/cmd"
-        payload = json.dumps({"action": action, "value": val, "ts": int(time.time())})
-        return self.client.publish(topic, payload, qos=1)
+        self.client.publish(topic, json.dumps({"action": action, "ts": int(time.time())}), qos=1)
 
-mqtt_service = MQTTService()
+mqtt_node = MQTTManager()
 
-# ==========================================
-# --- 3. MODELS & SECURITY ---
-# ==========================================
-class DeviceModel(BaseModel):
-    device_id: str
-    hardware_secret: str
-    device_name: Optional[str] = "New Device"
-
-class HeartbeatModel(BaseModel):
-    state: Dict[str, Any]
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-def create_token(device_id: str, scope: str, expire_days: int = 0, expire_mins: int = 60):
-    expire = datetime.utcnow() + (timedelta(days=expire_days) if expire_days else timedelta(minutes=expire_mins))
-    return jwt.encode({"sub": device_id, "scope": scope, "exp": expire}, JWT_SECRET_KEY, algorithm=ALGORITHM)
-
-async def validate_passport(token: str = Depends(oauth2_scheme)) -> str:
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
-        device_id = payload.get("sub")
-        if await redis_client.exists(f"blacklist:{device_id}"):
-            raise HTTPException(status_code=403, detail="Banned")
-        return device_id
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid Token")
-
-# ==========================================
-# --- 4. MAIN APP & LIFECYCLE ---
-# ==========================================
+# --- 2. LIFECYCLE & APP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    mqtt_service.start()
+    mqtt_node.start()
     await redis_client.ping()
-    logger.info("Enterprise IoT Gateway Online.")
     yield
-    mqtt_service.client.loop_stop()
+    mqtt_node.client.loop_stop()
     await redis_client.close()
 
-app = FastAPI(title="Enterprise IoT Gateway", lifespan=lifespan)
+app = FastAPI(title="Hardened IoT Hub 2026", lifespan=lifespan)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # ==========================================
-# --- 5. ROUTES (CURL & ALEXA) ---
+# --- 3. SECURITY DEPENDENCIES ---
 # ==========================================
 
-# --- [ADMIN] CURL Endpoints (Read/Update Code) ---
+async def validate_admin(api_key: str = Depends(admin_key_header)):
+    """Locks the /admin routes so only YOU can use them."""
+    if api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized Admin Access")
+    return api_key
 
-@app.get("/v1/admin/devices")
-async def list_devices():
-    """Read all devices from Supabase (Cold Layer)"""
-    res = supabase.table("devices").select("*").execute()
-    return res.data
+async def validate_passport(token: str = Depends(oauth2_scheme)):
+    """Verifies JWT signature AND checks the Redis Blacklist."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        dev_id = payload.get("sub")
+        # Hot Layer Check: Is the device banned?
+        if await redis_client.exists(f"blacklist:{dev_id}"):
+            raise HTTPException(status_code=403, detail="Device access revoked.")
+        return dev_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Passport Expired/Invalid")
 
-@app.post("/v1/admin/devices")
-async def add_device(device: DeviceModel):
-    """Insert a new device into the registry via CURL"""
-    res = supabase.table("devices").insert({
-        "device_id": device.device_id,
-        "hardware_secret": device.hardware_secret,
-        "device_name": device.device_name
-    }).execute()
-    return {"status": "created", "data": res.data}
+# ==========================================
+# --- 4. SECURE API ENDPOINTS ---
+# ==========================================
 
-@app.delete("/v1/admin/devices/{device_id}")
-async def delete_device(device_id: str):
-    """Delete a device and blacklist it in Redis instantly"""
-    supabase.table("devices").delete().eq("device_id", device_id).execute()
-    await redis_client.set(f"blacklist:{device_id}", "true")
-    return {"status": "deleted_and_blacklisted"}
+# --- A. ADMIN CRUD (CURL Only) ---
+@app.post("/v1/admin/devices", dependencies=[Depends(validate_admin)])
+async def register_device(device_id: str, secret: str):
+    """Registers a new device into the system securely."""
+    supabase.table("devices").insert({"device_id": device_id, "hardware_secret": secret}).execute()
+    return {"status": "success", "device": device_id}
 
-# --- [DEVICE] IoT Logic ---
+@app.post("/v1/admin/unban/{device_id}", dependencies=[Depends(validate_admin)])
+async def unban(device_id: str):
+    """Clears a device from the blacklist so it can re-provision."""
+    await redis_client.delete(f"blacklist:{device_id}")
+    return {"status": f"Device {device_id} is now welcome back."}
 
+# --- B. PROVISIONING (The Birth) ---
 @app.post("/v1/provision")
-async def provision(data: DeviceModel):
-    res = supabase.table("devices").select("*").eq("device_id", data.device_id).single().execute()
-    if not res.data or res.data['hardware_secret'] != data.hardware_secret:
-        raise HTTPException(status_code=401, detail="Auth Failed")
+async def provision(device_id: str, secret: str):
+    """Verifies hardware secret and starts a new session."""
+    res = supabase.table("devices").select("*").eq("device_id", device_id).single().execute()
+    if not res.data or res.data['hardware_secret'] != secret:
+        raise HTTPException(status_code=401, detail="Hardware rejected.")
+
+    # Generate a unique version for this session
+    session_ver = str(uuid.uuid4())
+    supabase.table("devices").update({"refresh_token_ver": session_ver}).eq("device_id", device_id).execute()
+
+    access = jwt.encode({"sub": device_id, "scope": "access", "exp": datetime.utcnow() + timedelta(minutes=60)}, JWT_SECRET)
+    refresh = jwt.encode({"sub": device_id, "scope": "refresh", "ver": session_ver, "exp": datetime.utcnow() + timedelta(days=365)}, JWT_SECRET)
     
-    return {
-        "access_token": create_token(data.device_id, "access"),
-        "refresh_token": create_token(data.device_id, "refresh", expire_days=365)
-    }
+    return {"access_token": access, "refresh_token": refresh}
 
+# --- C. REFRESH WITH ROTATION (The Hacker Trap) ---
+@app.post("/v1/refresh")
+async def refresh_passport(refresh_token: str = Header(...)):
+    try:
+        payload = jwt.decode(refresh_token, JWT_SECRET, algorithms=[ALGORITHM])
+        dev_id = payload.get("sub")
+        token_ver = payload.get("ver")
+
+        # 1. Check if this token version is still the "current" one in SQL
+        res = supabase.table("devices").select("refresh_token_ver").eq("device_id", dev_id).single().execute()
+        if not res.data or res.data['refresh_token_ver'] != token_ver:
+            # REUSE DETECTED: Someone (hacker or old client) tried to use an old token
+            await redis_client.set(f"blacklist:{dev_id}", "true", ex=86400)
+            raise HTTPException(status_code=403, detail="Security Breach: Token Reuse Detected. Banned.")
+
+        # 2. ROTATE: Generate NEW tokens and a NEW version
+        new_ver = str(uuid.uuid4())
+        supabase.table("devices").update({"refresh_token_ver": new_ver}).eq("device_id", dev_id).execute()
+
+        new_acc = jwt.encode({"sub": dev_id, "scope": "access", "exp": datetime.utcnow() + timedelta(minutes=60)}, JWT_SECRET)
+        new_ref = jwt.encode({"sub": dev_id, "scope": "refresh", "ver": new_ver, "exp": datetime.utcnow() + timedelta(days=365)}, JWT_SECRET)
+
+        return {"access_token": new_acc, "refresh_token": new_ref}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Session Expired")
+
+# --- D. ALEXA & HEARTBEAT ---
 @app.post("/v1/heartbeat")
-async def heartbeat(data: HeartbeatModel, device_id: str = Depends(validate_passport)):
-    """Update Hot Layer (Upstash Redis)"""
-    key = f"device:{device_id}:state"
-    mapping = {k: str(v) for k, v in data.state.items()}
-    mapping["last_seen"] = str(int(time.time()))
-    await redis_client.hset(key, mapping=mapping)
-    await redis_client.expire(key, 3600)
-    return {"status": "synced"}
-
-# --- [ALEXA] Smart Home integration ---
+async def heartbeat(state: Dict[str, Any], dev_id: str = Depends(validate_passport)):
+    await redis_client.hset(f"device:{dev_id}:state", mapping={k: str(v) for k, v in state.items()})
+    return {"status": "ok"}
 
 @app.post("/v1/alexa/smart-home")
-async def alexa_handler(request: Request, bg: BackgroundTasks):
-    body = await request.json()
-    header = body["directive"]["header"]
-    endpoint_id = body["directive"]["endpoint"]["endpointId"]
-    
-    # 1. Dispatch Command via MQTT
+async def alexa_gateway(request: Request, bg: BackgroundTasks):
+    data = await request.json()
+    header = data["directive"]["header"]
+    eid = data["directive"]["endpoint"]["endpointId"]
     action = "ON" if header["name"] == "TurnOn" else "OFF"
-    mqtt_service.publish_cmd(endpoint_id, action)
     
-    # 2. Log to SQL in background
-    bg.add_task(lambda: supabase.table("commands").insert({"device_id": endpoint_id, "action": action}).execute())
-
-    return {
-        "event": {
-            "header": {"namespace": "Alexa", "name": "Response", "messageId": header["messageId"] + "-R", "payloadVersion": "3"},
-            "endpoint": {"endpointId": endpoint_id},
-            "payload": {}
-        }
-    }
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+    mqtt_node.send(eid, action)
+    bg.add_task(lambda: supabase.table("commands").insert({"device_id": eid, "action": action}).execute())
+    
+    return {"event": {"header": {"namespace": "Alexa", "name": "Response", "messageId": header["messageId"] + "-R", "payloadVersion": "3"}, "endpoint": {"endpointId": eid}, "payload": {}}}
