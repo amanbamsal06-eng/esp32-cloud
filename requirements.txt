@@ -1,5 +1,7 @@
 fastapi
 uvicorn
+python-jose
 supabase
+redis
 paho-mqtt
 python-dotenv
