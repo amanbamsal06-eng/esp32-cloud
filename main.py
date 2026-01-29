@@ -23,7 +23,7 @@ JWT_SECRET = os.getenv("JWT_SECRET_KEY")
 ALGORITHM = "HS256"
 
 # Database Connections
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 redis_client = redis.from_url(os.getenv("UPSTASH_REDIS_URL"), decode_responses=True)
 
 # MQTT v5 Manager
