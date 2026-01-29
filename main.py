@@ -16,6 +16,10 @@ load_dotenv()
 # -------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+print(f"DEBUG: SUPABASE_URL is {'SET' if SUPABASE_URL else 'MISSING'}")
+print(f"DEBUG: SUPABASE_KEY is {'SET' if SUPABASE_KEY else 'MISSING'}")
+
 MQTT_BROKER = os.getenv("MQTT_BROKER", "broker.hivemq.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USER = os.getenv("MQTT_USER")
