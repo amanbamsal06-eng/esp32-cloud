@@ -124,16 +124,33 @@ def provision_device(device_id: str):
     return {"status": "created", "device_token": token}
 
 @app.post("/command/{device_id}", dependencies=[Depends(validate_api_key)])
-def send_command(device_id: str, cmd: Command):
+def send_command(
+    device_id: str, 
+    cmd: Command, 
+    device_token: str = Header(...)  # <--- This requires 'device-token' in the header
+):
     """
     Sends a command via MQTT. 
-    Protected by API Key (intended for your App to trigger).
+    Checks:
+    1. API Key (Admin Access)
+    2. Device Token (Specific Device Access)
     """
-    # Verify device exists before publishing
-    device = supabase.table("devices").select("is_online").eq("device_id", device_id).single().execute()
-    if not device.data:
+    
+    # 1. Fetch the device from Supabase to check the token
+    res = supabase.table("devices").select("device_token").eq("device_id", device_id).single().execute()
+    
+    if not res.data:
         raise HTTPException(status_code=404, detail="Device not found")
 
+    # 2. AUTH CHECK: Does the token in the header match the token in the DB?
+    if res.data.get("device_token") != device_token:
+        logger.warning(f"Unauthorized command attempt for device {device_id}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Invalid Device Token"
+        )
+
+    # 3. If auth passes, proceed to MQTT
     topic = f"home/devices/{device_id}/cmd"
     payload = cmd.dict(exclude_none=True)
     
@@ -142,7 +159,11 @@ def send_command(device_id: str, cmd: Command):
     if result.rc != mqtt.MQTT_ERR_SUCCESS:
         raise HTTPException(status_code=500, detail="MQTT Broker unreachable")
 
-    return {"status": "dispatched", "device_id": device_id, "payload": payload}
+    return {
+        "status": "dispatched", 
+        "device_id": device_id, 
+        "authorized": True
+    }
 
 @app.post("/heartbeat")
 def heartbeat(update: DeviceStateUpdate, device_token: str = Header(...)):
