@@ -1,5 +1,5 @@
 # ==========================================
-# IoT Home Automation Hub - Production Server
+# IoT Home Automation Hub - Production Server (Optimized)
 # Stack: FastAPI + Supabase + Redis + MQTT + Alexa
 # ==========================================
 
@@ -9,11 +9,11 @@ import time
 import uuid
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 
 # Third-party imports
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, status, Request, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, APIKeyHeader
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -53,7 +53,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
 
 # ==========================================
-# MQTT MANAGER WITH RELIABILITY
+# MQTT MANAGER
 # ==========================================
 class MQTTManager:
     def __init__(self):
@@ -67,7 +67,6 @@ class MQTTManager:
     
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         logger.info(f"✅ MQTT Connected: {rc}")
-        # Subscribe to all device status updates
         self.client.subscribe("iot/+/status")
     
     def _on_disconnect(self, client, userdata, rc, properties=None):
@@ -78,28 +77,26 @@ class MQTTManager:
             device_id = msg.topic.split('/')[1]
             payload = json.loads(msg.payload.decode())
             logger.info(f"📥 Device {device_id} status: {payload}")
-            # Could update Redis/Supabase here with device responses
         except Exception as e:
-            logger.error(f"Message parse error: {e}")
+            logger.error(f"MQTT message parse error: {e}")
     
     def start(self):
         try:
             self.client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=60)
             self.client.loop_start()
-            logger.info(f"🚀 MQTT Manager started on {MQTT_BROKER}:{MQTT_PORT}")
+            logger.info(f"🚀 MQTT started on {MQTT_BROKER}:{MQTT_PORT}")
         except Exception as e:
             logger.error(f"❌ MQTT connection failed: {e}")
     
-    def send_command(self, device_id: str, command: Dict[str, Any]):
-        topic = f"iot/{device_id}/cmd"
-        payload = json.dumps({**command, "ts": int(time.time())})
+    def publish_state_update(self, device_id: str, state: Dict[str, Any]):
+        """Notify ESP8266 of state change via MQTT"""
+        topic = f"iot/{device_id}/state"
+        payload = json.dumps(state)
         result = self.client.publish(topic, payload, qos=1)
-        
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            logger.info(f"📤 State update sent to {device_id}")
+        else:
             logger.error(f"❌ MQTT publish failed for {device_id}")
-            raise HTTPException(status_code=503, detail="Command delivery failed")
-        
-        logger.info(f"📤 Sent to {device_id}: {command}")
 
 mqtt_manager = MQTTManager()
 
@@ -108,37 +105,26 @@ mqtt_manager = MQTTManager()
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 🟢 STARTUP
-    logger.info("🟢 Starting IoT Hub Server...")
+    logger.info("🟢 Starting IoT Hub...")
     mqtt_manager.start()
     await redis_client.ping()
-    logger.info("✅ Redis connected")
     logger.info("✅ Server ready")
-    
     yield
-    
-    # 🔴 SHUTDOWN
     logger.info("🔴 Shutting down...")
     mqtt_manager.client.loop_stop()
     await redis_client.close()
-    logger.info("👋 Goodbye")
 
-app = FastAPI(
-    title="IoT Home Automation Hub",
-    version="2.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="IoT Home Automation Hub", version="3.0", lifespan=lifespan)
 
 # ==========================================
-# SECURITY DEPENDENCIES
+# SECURITY
 # ==========================================
 ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=True)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 async def validate_admin(api_key: str = Depends(ADMIN_KEY_HEADER)):
     if api_key != ADMIN_API_KEY:
-        logger.warning("🚨 Unauthorized admin attempt")
-        raise HTTPException(status_code=403, detail="Unauthorized Admin Access")
+        raise HTTPException(status_code=403, detail="Unauthorized")
     return api_key
 
 # This function runs BEFORE the endpoint handler
@@ -185,23 +171,22 @@ async def validate_device_token(token: str = Depends(oauth2_scheme)):
         logger.error(f"❌ JWT validation failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
-
 # ==========================================
 # PYDANTIC MODELS
 # ==========================================
 class DeviceRegister(BaseModel):
     device_id: str
     secret: str
+    name: Optional[str] = None
+    num_relays: int = 4
 
 class ProvisionRequest(BaseModel):
     device_id: str
     secret: str
 
-class HeartbeatPayload(BaseModel):
-    relays: Dict[str, bool]  # e.g., {"relay1": true, "relay2": false}
-    uptime: int
-    wifi_rssi: Optional[int] = None
-    free_heap: Optional[int] = None
+class RelayUpdate(BaseModel):
+    state: bool  # true = ON, false = OFF
+    timer_minutes: Optional[int] = None  # Auto turn off/on after X minutes
 
 class AlexaRequest(BaseModel):
     directive: Dict[str, Any]
@@ -211,13 +196,24 @@ class AlexaRequest(BaseModel):
 # ==========================================
 @app.post("/v1/admin/devices", dependencies=[Depends(validate_admin)])
 async def register_device(req: DeviceRegister):
-    """Register a new ESP8266 device with hardware secret"""
+    """Register new device"""
     try:
+        # Store in Supabase (permanent registry)
         supabase.table("devices").insert({
             "device_id": req.device_id,
             "hardware_secret": req.secret,
+            "name": req.name or req.device_id,
+            "num_relays": req.num_relays,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
+        
+        # Initialize state in Redis
+        initial_state = {
+            "relays": json.dumps({f"relay{i+1}": {"state": False, "timer_end": None} for i in range(req.num_relays)}),
+            "online": "false",
+            "num_relays": req.num_relays
+        }
+        await redis_client.hset(f"device:{req.device_id}:state", mapping=initial_state)
         
         logger.info(f"✅ Device registered: {req.device_id}")
         return {"status": "success", "device_id": req.device_id}
@@ -227,40 +223,30 @@ async def register_device(req: DeviceRegister):
 
 @app.delete("/v1/admin/devices/{device_id}", dependencies=[Depends(validate_admin)])
 async def ban_device(device_id: str):
-    """Ban a device (blacklist)"""
     await redis_client.set(f"blacklist:{device_id}", "banned", ex=86400*365)
-    logger.warning(f"🚫 Device banned: {device_id}")
-    return {"status": "banned", "device_id": device_id}
+    return {"status": "banned"}
 
 @app.post("/v1/admin/unban/{device_id}", dependencies=[Depends(validate_admin)])
 async def unban_device(device_id: str):
-    """Remove device from blacklist"""
     await redis_client.delete(f"blacklist:{device_id}")
-    logger.info(f"✅ Device unbanned: {device_id}")
-    return {"status": "unbanned", "device_id": device_id}
+    return {"status": "unbanned"}
 
 # ==========================================
 # 🔐 DEVICE AUTHENTICATION
 # ==========================================
 @app.post("/v1/provision")
 async def provision_device(req: ProvisionRequest):
-    """ESP8266 first boot: exchange hardware secret for JWT tokens"""
     try:
-        # Verify device exists and secret matches
         res = supabase.table("devices").select("*").eq("device_id", req.device_id).single().execute()
-        
         if not res.data or res.data.get('hardware_secret') != req.secret:
-            logger.warning(f"🚨 Invalid provision attempt: {req.device_id}")
-            raise HTTPException(status_code=401, detail="Invalid device credentials")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
         
-        # Create new session version (for refresh token rotation)
         session_ver = str(uuid.uuid4())
         supabase.table("devices").update({
             "refresh_token_ver": session_ver,
             "last_provision": datetime.utcnow().isoformat()
         }).eq("device_id", req.device_id).execute()
         
-        # Generate tokens
         access_token = jwt.encode({
             "sub": req.device_id,
             "scope": "access",
@@ -290,238 +276,194 @@ async def provision_device(req: ProvisionRequest):
 
 @app.post("/v1/refresh")
 async def refresh_token(refresh_token: str = Header(..., alias="Authorization")):
-    """Refresh access token using refresh token"""
     try:
-        # Remove "Bearer " prefix if present
         token = refresh_token.replace("Bearer ", "")
-        
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         device_id = payload.get("sub")
         token_ver = payload.get("ver")
         
-        # Verify token version matches DB (detect token reuse attacks)
         res = supabase.table("devices").select("refresh_token_ver").eq("device_id", device_id).single().execute()
-        
         if not res.data or res.data['refresh_token_ver'] != token_ver:
-            # Token reuse detected - ban device
             await redis_client.set(f"blacklist:{device_id}", "token_reuse", ex=86400)
-            logger.critical(f"🚨 TOKEN REUSE DETECTED: {device_id} - BANNED")
-            raise HTTPException(status_code=403, detail="Security violation: Token reuse detected")
+            logger.critical(f"🚨 TOKEN REUSE: {device_id}")
+            raise HTTPException(status_code=403, detail="Token reuse detected")
         
-        # Generate new tokens with new version
         new_ver = str(uuid.uuid4())
-        supabase.table("devices").update({
-            "refresh_token_ver": new_ver
-        }).eq("device_id", device_id).execute()
+        supabase.table("devices").update({"refresh_token_ver": new_ver}).eq("device_id", device_id).execute()
         
-        new_access = jwt.encode({
-            "sub": device_id,
-            "scope": "access",
-            "exp": datetime.utcnow() + timedelta(hours=1)
-        }, JWT_SECRET, algorithm=ALGORITHM)
+        new_access = jwt.encode({"sub": device_id, "scope": "access", "exp": datetime.utcnow() + timedelta(hours=1)}, JWT_SECRET, algorithm=ALGORITHM)
+        new_refresh = jwt.encode({"sub": device_id, "scope": "refresh", "ver": new_ver, "exp": datetime.utcnow() + timedelta(days=365)}, JWT_SECRET, algorithm=ALGORITHM)
         
-        new_refresh = jwt.encode({
-            "sub": device_id,
-            "scope": "refresh",
-            "ver": new_ver,
-            "exp": datetime.utcnow() + timedelta(days=365)
-        }, JWT_SECRET, algorithm=ALGORITHM)
-        
-        logger.info(f"🔄 Token refreshed: {device_id}")
-        return {
-            "access_token": new_access,
-            "refresh_token": new_refresh,
-            "expires_in": 3600
-        }
+        return {"access_token": new_access, "refresh_token": new_refresh, "expires_in": 3600}
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+        raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
-        logger.error(f"❌ Refresh error: {e}")
-        raise HTTPException(status_code=500, detail="Token refresh failed")
-
-# ==========================================
-# 📡 DEVICE COMMUNICATION
-# ==========================================
-@app.post("/v1/heartbeat")
-async def device_heartbeat(
-    payload: HeartbeatPayload,
-    device_id: str = Depends(validate_device_token)
-):
-    """ESP8266 sends state every 60 seconds"""
-    try:
-        timestamp = int(time.time())
-        
-        # Store current state in Redis (with 5-minute TTL)
-        state_data = {
-            "relays": json.dumps(payload.relays),
-            "uptime": payload.uptime,
-            "wifi_rssi": payload.wifi_rssi or -100,
-            "free_heap": payload.free_heap or 0,
-            "last_seen": timestamp
-        }
-        
-        await redis_client.hset(f"device:{device_id}:state", mapping={k: str(v) for k, v in state_data.items()})
-        await redis_client.expire(f"device:{device_id}:state", 300)
-        
-        # Quick last-seen marker
-        await redis_client.set(f"device:{device_id}:last_seen", timestamp, ex=86400)
-        
-        logger.debug(f"💓 Heartbeat from {device_id}: uptime={payload.uptime}s")
-        
-        return {
-            "status": "ok",
-            "server_time": timestamp,
-            "next_heartbeat": 60
-        }
-    except Exception as e:
-        logger.error(f"❌ Heartbeat error for {device_id}: {e}")
-        raise HTTPException(status_code=500, detail="Heartbeat processing failed")
-
-@app.post("/v1/command/{device_id}")
-async def send_device_command(
-    device_id: str,
-    action: str,
-    relay: Optional[int] = None,
-    admin_key: str = Depends(validate_admin)
-):
-    """Admin: Send command to ESP8266 via MQTT"""
-    try:
-        # Check if device is online (heartbeat within last 5 minutes)
-        last_seen = await redis_client.get(f"device:{device_id}:last_seen")
-        if not last_seen or (int(time.time()) - int(last_seen)) > 300:
-            raise HTTPException(status_code=503, detail="Device is offline")
-        
-        command = {"action": action}
-        if relay is not None:
-            command["relay"] = relay
-        
-        mqtt_manager.send_command(device_id, command)
-        
-        # Log command to database
-        supabase.table("commands").insert({
-            "device_id": device_id,
-            "command": command,
-            "source": "admin",
-            "timestamp": datetime.utcnow().isoformat()
-        }).execute()
-        
-        return {"status": "sent", "command": command}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Command failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 🗣️ ALEXA SMART HOME INTEGRATION
+# 📡 DEVICE COMMUNICATION (OPTIMIZED)
+# ==========================================
+@app.post("/v1/ping")
+async def device_ping(device_id: str = Depends(validate_device_token)):
+    """Lightweight heartbeat - just mark device online"""
+    timestamp = int(time.time())
+    await redis_client.setex(f"device:{device_id}:online", 300, "true")  # 5 min TTL
+    await redis_client.hset(f"device:{device_id}:state", "last_seen", timestamp)
+    logger.debug(f"💓 Ping from {device_id}")
+    return {"status": "ok", "server_time": timestamp}
+
+@app.get("/v1/device/{device_id}/state")
+async def get_device_state(
+    device_id: str,
+    requester: str = Depends(validate_device_token)  # Any authenticated device can query
+):
+    """Get current state of device from Redis"""
+    state = await redis_client.hgetall(f"device:{device_id}:state")
+    if not state:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    # Check if online
+    is_online = await redis_client.exists(f"device:{device_id}:online")
+    
+    return {
+        "device_id": device_id,
+        "online": bool(is_online),
+        "relays": json.loads(state.get("relays", "{}")),
+        "last_seen": state.get("last_seen"),
+        "num_relays": int(state.get("num_relays", 4))
+    }
+
+@app.post("/v1/device/{device_id}/relay/{relay_id}")
+async def update_relay(
+    device_id: str,
+    relay_id: str,  # e.g., "relay1", "relay2"
+    update: RelayUpdate,
+    requester: str = Depends(validate_device_token)  # Can be admin OR device
+):
+    """
+    Update relay state (called by admin, Alexa, or ESP8266 itself)
+    Changes are saved to Redis and pushed to ESP8266 via MQTT
+    """
+    # Get current state from Redis
+    current_state = await redis_client.hget(f"device:{device_id}:state", "relays")
+    if not current_state:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    relays = json.loads(current_state)
+    if relay_id not in relays:
+        raise HTTPException(status_code=400, detail=f"Relay {relay_id} not found")
+    
+    # Calculate timer end time if timer is set
+    timer_end = None
+    if update.timer_minutes:
+        timer_end = int(time.time()) + (update.timer_minutes * 60)
+    
+    # Update relay state
+    relays[relay_id] = {
+        "state": update.state,
+        "timer_end": timer_end,
+        "updated_at": int(time.time()),
+        "updated_by": requester
+    }
+    
+    # Save to Redis
+    await redis_client.hset(f"device:{device_id}:state", "relays", json.dumps(relays))
+    
+    # Notify ESP8266 via MQTT
+    mqtt_manager.publish_state_update(device_id, {
+        "relay_id": relay_id,
+        "state": update.state,
+        "timer_end": timer_end
+    })
+    
+    # Log to Supabase (audit trail)
+    supabase.table("commands").insert({
+        "device_id": device_id,
+        "command": {"relay": relay_id, "state": update.state, "timer_minutes": update.timer_minutes},
+        "source": requester,
+        "timestamp": datetime.utcnow().isoformat()
+    }).execute()
+    
+    logger.info(f"🔧 {requester} updated {device_id}/{relay_id} → {update.state}")
+    
+    return {
+        "status": "updated",
+        "device_id": device_id,
+        "relay_id": relay_id,
+        "state": update.state,
+        "timer_end": timer_end
+    }
+
+# ==========================================
+# 🗣️ ALEXA INTEGRATION
 # ==========================================
 @app.post("/v1/alexa/smart-home")
 async def alexa_smart_home(req: AlexaRequest, bg: BackgroundTasks):
-    """Alexa Smart Home Skill endpoint"""
     try:
         directive = req.directive
         header = directive["header"]
         namespace = header["namespace"]
         name = header["name"]
         
-        # === DISCOVERY ===
-        if namespace == "Alexa.Discovery" and name == "Discover":
-            # Fetch all registered devices
-            devices_res = supabase.table("devices").select("device_id, name, capabilities").execute()
-            
+        # Discovery
+        if namespace == "Alexa.Discovery":
+            devices_res = supabase.table("devices").select("device_id, name, num_relays").execute()
             endpoints = []
             for device in devices_res.data:
                 endpoints.append({
                     "endpointId": device["device_id"],
-                    "friendlyName": device.get("name", f"Smart Switch {device['device_id']}"),
-                    "description": "ESP8266 Smart Relay",
+                    "friendlyName": device.get("name", device["device_id"]),
+                    "description": f"Smart Switch with {device.get('num_relays', 4)} relays",
                     "manufacturerName": "HomeAutomation",
                     "displayCategories": ["SWITCH"],
-                    "capabilities": [
-                        {
-                            "type": "AlexaInterface",
-                            "interface": "Alexa.PowerController",
-                            "version": "3",
-                            "properties": {
-                                "supported": [{"name": "powerState"}],
-                                "proactivelyReported": False,
-                                "retrievable": True
-                            }
-                        },
-                        {
-                            "type": "AlexaInterface",
-                            "interface": "Alexa.EndpointHealth",
-                            "version": "3",
-                            "properties": {
-                                "supported": [{"name": "connectivity"}],
-                                "proactivelyReported": False,
-                                "retrievable": True
-                            }
+                    "capabilities": [{
+                        "type": "AlexaInterface",
+                        "interface": "Alexa.PowerController",
+                        "version": "3",
+                        "properties": {
+                            "supported": [{"name": "powerState"}],
+                            "proactivelyReported": False,
+                            "retrievable": True
                         }
-                    ]
+                    }]
                 })
-            
-            logger.info(f"🔍 Alexa Discovery: {len(endpoints)} devices")
             return {
                 "event": {
-                    "header": {
-                        "namespace": "Alexa.Discovery",
-                        "name": "Discover.Response",
-                        "payloadVersion": "3",
-                        "messageId": str(uuid.uuid4())
-                    },
+                    "header": {"namespace": "Alexa.Discovery", "name": "Discover.Response", "payloadVersion": "3", "messageId": str(uuid.uuid4())},
                     "payload": {"endpoints": endpoints}
                 }
             }
         
-        # === POWER CONTROL ===
+        # Power Control
         if namespace == "Alexa.PowerController":
             endpoint_id = directive["endpoint"]["endpointId"]
-            action = "ON" if name == "TurnOn" else "OFF"
+            action = name == "TurnOn"
             
-            # Check if device is online
-            last_seen = await redis_client.get(f"device:{endpoint_id}:last_seen")
-            if not last_seen or (int(time.time()) - int(last_seen)) > 300:
-                logger.warning(f"⚠️ Alexa command to offline device: {endpoint_id}")
+            # Check online
+            is_online = await redis_client.exists(f"device:{endpoint_id}:online")
+            if not is_online:
                 return {
                     "event": {
-                        "header": {
-                            "namespace": "Alexa",
-                            "name": "ErrorResponse",
-                            "messageId": str(uuid.uuid4()),
-                            "payloadVersion": "3"
-                        },
-                        "payload": {
-                            "type": "ENDPOINT_UNREACHABLE",
-                            "message": "Device is offline or not responding"
-                        }
+                        "header": {"namespace": "Alexa", "name": "ErrorResponse", "messageId": str(uuid.uuid4()), "payloadVersion": "3"},
+                        "payload": {"type": "ENDPOINT_UNREACHABLE", "message": "Device offline"}
                     }
                 }
             
-            # Send MQTT command
-            mqtt_manager.send_command(endpoint_id, {"action": action, "source": "alexa"})
+            # Update relay1 (default for Alexa single-relay control)
+            current_state = await redis_client.hget(f"device:{endpoint_id}:state", "relays")
+            relays = json.loads(current_state)
+            relays["relay1"]["state"] = action
+            relays["relay1"]["updated_at"] = int(time.time())
+            await redis_client.hset(f"device:{endpoint_id}:state", "relays", json.dumps(relays))
             
-            # Log command in background
-            bg.add_task(
-                lambda: supabase.table("commands").insert({
-                    "device_id": endpoint_id,
-                    "command": {"action": action},
-                    "source": "alexa",
-                    "timestamp": datetime.utcnow().isoformat()
-                }).execute()
-            )
+            # Notify device
+            mqtt_manager.publish_state_update(endpoint_id, {"relay_id": "relay1", "state": action})
             
-            logger.info(f"🗣️ Alexa command: {endpoint_id} → {action}")
+            logger.info(f"🗣️ Alexa: {endpoint_id}/relay1 → {action}")
             
-            # Response with state context
             return {
                 "event": {
-                    "header": {
-                        "namespace": "Alexa",
-                        "name": "Response",
-                        "messageId": str(uuid.uuid4()),
-                        "payloadVersion": "3"
-                    },
+                    "header": {"namespace": "Alexa", "name": "Response", "messageId": str(uuid.uuid4()), "payloadVersion": "3"},
                     "endpoint": {"endpointId": endpoint_id},
                     "payload": {}
                 },
@@ -529,69 +471,61 @@ async def alexa_smart_home(req: AlexaRequest, bg: BackgroundTasks):
                     "properties": [{
                         "namespace": "Alexa.PowerController",
                         "name": "powerState",
-                        "value": action,
+                        "value": "ON" if action else "OFF",
                         "timeOfSample": datetime.utcnow().isoformat() + "Z",
                         "uncertaintyInMilliseconds": 500
                     }]
                 }
             }
         
-        # Unsupported directive
-        logger.warning(f"⚠️ Unsupported Alexa directive: {namespace}.{name}")
         raise HTTPException(status_code=400, detail="Unsupported directive")
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"❌ Alexa handler error: {e}")
-        raise HTTPException(status_code=500, detail="Alexa processing failed")
+        logger.error(f"❌ Alexa error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 🩺 HEALTH & STATUS
+# 🩺 HEALTH & MONITORING
 # ==========================================
 @app.get("/health")
 async def health_check():
-    """Service health check"""
-    checks = {
-        "redis": False,
-        "mqtt": mqtt_manager.client.is_connected(),
-        "supabase": False
-    }
-    
-    # Test Redis
+    checks = {"redis": False, "mqtt": mqtt_manager.client.is_connected(), "supabase": False}
     try:
         await redis_client.ping()
         checks["redis"] = True
-    except Exception as e:
-        logger.error(f"Redis health check failed: {e}")
-    
-    # Test Supabase
+    except: pass
     try:
         supabase.table("devices").select("count", count="exact").limit(1).execute()
         checks["supabase"] = True
-    except Exception as e:
-        logger.error(f"Supabase health check failed: {e}")
-    
-    all_healthy = all(checks.values())
-    status_code = 200 if all_healthy else 503
-    
-    return {
-        "status": "healthy" if all_healthy else "degraded",
-        "services": checks,
-        "timestamp": int(time.time()),
-        "version": "2.0"
-    }
+    except: pass
+    return {"status": "healthy" if all(checks.values()) else "degraded", "services": checks, "timestamp": int(time.time())}
+
+@app.get("/v1/devices/online")
+async def get_online_devices(admin_key: str = Depends(validate_admin)):
+    """Get list of currently online devices"""
+    devices = supabase.table("devices").select("device_id, name").execute()
+    online_devices = []
+    for device in devices.data:
+        is_online = await redis_client.exists(f"device:{device['device_id']}:online")
+        if is_online:
+            state = await redis_client.hgetall(f"device:{device['device_id']}:state")
+            online_devices.append({
+                "device_id": device["device_id"],
+                "name": device.get("name"),
+                "relays": json.loads(state.get("relays", "{}")),
+                "last_seen": state.get("last_seen")
+            })
+    return {"online_count": len(online_devices), "devices": online_devices}
 
 @app.get("/")
 async def root():
     return {
         "service": "IoT Home Automation Hub",
-        "version": "2.0",
-        "status": "running",
+        "version": "3.0",
+        "features": ["Redis-first state", "Lightweight ping", "Real-time MQTT sync", "Timer support"],
         "endpoints": {
-            "health": "/health",
-            "admin": "/v1/admin/*",
-            "device": "/v1/provision, /v1/heartbeat",
-            "alexa": "/v1/alexa/smart-home"
+            "ping": "/v1/ping",
+            "state": "/v1/device/{id}/state",
+            "relay": "/v1/device/{id}/relay/{relay_id}",
+            "online": "/v1/devices/online"
         }
     }
