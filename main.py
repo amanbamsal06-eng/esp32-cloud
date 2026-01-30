@@ -49,7 +49,7 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 # ==========================================
 # DATABASE & CACHE CLIENTS
 # ==========================================
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
 
 # ==========================================
