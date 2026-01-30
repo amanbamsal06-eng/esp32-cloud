@@ -141,20 +141,50 @@ async def validate_admin(api_key: str = Depends(ADMIN_KEY_HEADER)):
         raise HTTPException(status_code=403, detail="Unauthorized Admin Access")
     return api_key
 
+# This function runs BEFORE the endpoint handler
 async def validate_device_token(token: str = Depends(oauth2_scheme)):
+    """
+    This dependency function extracts and validates JWT token
+    It runs automatically when endpoint has: device_id: str = Depends(validate_device_token)
+    """
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        device_id = payload.get("sub")
+        # Step 1: Decode the JWT token
+        payload = jwt.decode(
+            token,                    # The token from Authorization header
+            JWT_SECRET,               # Secret key to verify signature
+            algorithms=[ALGORITHM]    # HS256
+        )
         
-        # Check if device is blacklisted
-        if await redis_client.exists(f"blacklist:{device_id}"):
-            logger.warning(f"🚫 Blocked device attempted access: {device_id}")
+        # Token decoded successfully - now payload looks like:
+        # {"sub": "esp8266_001", "scope": "access", "exp": 1738276800}
+        
+        # Step 2: Extract device_id
+        device_id = payload.get("sub")
+        if not device_id:
+            raise HTTPException(status_code=401, detail="Invalid token: no device_id")
+        
+        # Step 3: Check if token expired (jwt.decode already checks this, but just in case)
+        exp = payload.get("exp")
+        if exp and exp < int(time.time()):
+            raise HTTPException(status_code=401, detail="Token expired")
+        
+        # Step 4: Check if device is blacklisted
+        is_banned = await redis_client.exists(f"blacklist:{device_id}")
+        if is_banned:
+            logger.warning(f"🚫 Banned device tried to access: {device_id}")
             raise HTTPException(status_code=403, detail="Device access revoked")
         
+        # Step 5: All checks passed - return device_id
+        logger.debug(f"✅ Token validated for device: {device_id}")
         return device_id
-    except JWTError as e:
-        logger.error(f"🔐 Token validation failed: {e}")
-        raise HTTPException(status_code=401, detail="Invalid/Expired Token")
+        
+    except jwt.ExpiredSignatureError:
+        logger.error("❌ Token expired")
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.JWTError as e:
+        logger.error(f"❌ JWT validation failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 
 # ==========================================
 # PYDANTIC MODELS
